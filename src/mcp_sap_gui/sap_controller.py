@@ -32,9 +32,11 @@ from .models import (  # noqa: F401
 )
 from .tables import TablesMixin
 from .trees import TreesMixin
+from .workflows import WorkflowMixin
 
 
 class SAPGUIController(
+    WorkflowMixin,
     FieldsMixin,
     TablesMixin,
     TreesMixin,
@@ -49,6 +51,7 @@ class SAPGUIController(
     fields, and extracting data from tables.
 
     Composed from mixins:
+    - WorkflowMixin: composite workflow operations built from lower-level tools
     - SAPGUIControllerBase: connection, navigation, screen info
     - FieldsMixin: field read/write, buttons, checkboxes, combos, textedit
     - TablesMixin: ALV grid + TableControl reading, selection, cell ops

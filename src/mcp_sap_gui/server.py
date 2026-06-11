@@ -759,6 +759,17 @@ async def sap_get_screen_info(ctx: Context) -> dict:
     return await _com(c.get_screen_info)
 
 
+@mcp.tool(annotations=_READ_ONLY, tags=_TAGS_READ)
+async def sap_get_light_snapshot(ctx: Context) -> dict:
+    """Get a lightweight screen snapshot without enumerating screen elements.
+
+    Returns current screen info, active window, fingerprint, and popup summary
+    when a popup is active. Use this for fast state checks between actions.
+    """
+    c = _ctrl(ctx)
+    return await _com(c.get_light_snapshot)
+
+
 # ===========================================================================
 # Field tools
 # ===========================================================================
@@ -887,6 +898,29 @@ async def sap_set_batch_fields(
     return await _com(
         lambda: c.set_batch_fields(
             fields, skip_readonly=skip_readonly, validate=validate,
+        )
+    )
+
+
+@mcp.tool(annotations=_WRITE, tags=_TAGS_WRITE)
+async def sap_set_fields_and_enter(
+    fields: dict,
+    ctx: Context,
+    skip_readonly: bool = True,
+) -> dict:
+    """Set multiple fields and press Enter once, returning validation screen.
+
+    This is a composite tool for form-fill workflows. It reduces repeated
+    field writes plus separate Enter/screen-info calls into one MCP call.
+    """
+    _check_write()
+    for fid, val in fields.items():
+        _check_okcode_bypass(fid, str(val))
+    c = _ctrl(ctx)
+    return await _com(
+        lambda: c.set_fields_and_enter(
+            fields,
+            skip_readonly=skip_readonly,
         )
     )
 
@@ -1186,6 +1220,30 @@ async def sap_handle_popup(
     _check_write()
     c = _ctrl(ctx)
     return await _com(lambda: c.handle_popup(action, button_text))
+
+
+@mcp.tool(annotations=_WRITE, tags=_TAGS_WRITE)
+async def sap_select_popup_table_row_and_confirm(
+    table_id: str,
+    row: int,
+    ctx: Context,
+    confirm_action: Literal["confirm", "auto"] = "confirm",
+) -> dict:
+    """Select a row in an active popup table and confirm the popup.
+
+    Use for selection dialogs such as MM03 view selection where the user picks
+    a row and then presses Continue/Enter. Returns selection details and final
+    screen info.
+    """
+    _check_write()
+    c = _ctrl(ctx)
+    return await _com(
+        lambda: c.select_popup_table_row_and_confirm(
+            table_id,
+            row,
+            confirm_action=confirm_action,
+        )
+    )
 
 
 # ---- Toolbar discovery ----

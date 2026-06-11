@@ -311,6 +311,49 @@ class TestOkCodeBypassPrevention:
         assert result["skipped"] == 1
 
     @pytest.mark.asyncio
+    async def test_set_fields_and_enter_forwards_skip_readonly_default(self, srv):
+        """sap_set_fields_and_enter uses controller composite workflow."""
+        ctx = _make_mock_ctx()
+        mock_ctrl = MagicMock()
+        mock_ctrl.set_fields_and_enter.return_value = {
+            "action": "set_fields_and_enter",
+            "total": 1,
+            "succeeded": 1,
+            "screen": {"transaction": "MM03"},
+        }
+        with patch.object(srv, '_ctrl', return_value=mock_ctrl):
+            result = await srv.sap_set_fields_and_enter({"f": "v"}, ctx)
+        mock_ctrl.set_fields_and_enter.assert_called_once_with(
+            {"f": "v"},
+            skip_readonly=True,
+        )
+        assert result["screen"]["transaction"] == "MM03"
+
+    @pytest.mark.asyncio
+    async def test_set_fields_and_enter_blocks_okcd(self, srv):
+        """sap_set_fields_and_enter blocks blocked transactions on OK-code field."""
+        ctx = _make_mock_ctx()
+        with pytest.raises(ValueError, match="blocked by security policy"):
+            await srv.sap_set_fields_and_enter({
+                "wnd[0]/tbar[0]/okcd": "/NSU01",
+            }, ctx)
+
+    @pytest.mark.asyncio
+    async def test_get_light_snapshot_uses_controller_workflow(self, srv):
+        """sap_get_light_snapshot calls the controller composite read workflow."""
+        ctx = _make_mock_ctx()
+        mock_ctrl = MagicMock()
+        mock_ctrl.get_light_snapshot.return_value = {
+            "active_window": "wnd[0]",
+            "fingerprint": "fp",
+            "screen": {"transaction": "MM03"},
+        }
+        with patch.object(srv, '_ctrl', return_value=mock_ctrl):
+            result = await srv.sap_get_light_snapshot(ctx)
+        mock_ctrl.get_light_snapshot.assert_called_once_with()
+        assert result["fingerprint"] == "fp"
+
+    @pytest.mark.asyncio
     async def test_screen_elements_surfaces_discovery_errors(self, srv):
         """sap_get_screen_elements should surface invalid-container errors."""
         ctx = _make_mock_ctx()
@@ -511,6 +554,13 @@ class TestReadOnlyMode:
             )
 
     @pytest.mark.asyncio
+    async def test_readonly_blocks_set_fields_and_enter(self, readonly_srv):
+        """sap_set_fields_and_enter raises in read-only mode."""
+        ctx = _make_mock_ctx()
+        with pytest.raises(ValueError, match="read-only"):
+            await readonly_srv.sap_set_fields_and_enter({"wnd[0]/usr/txt": "v"}, ctx)
+
+    @pytest.mark.asyncio
     async def test_readonly_blocks_set_textedit(self, readonly_srv):
         """sap_set_textedit raises in read-only mode."""
         ctx = _make_mock_ctx()
@@ -565,6 +615,17 @@ class TestReadOnlyMode:
         ctx = _make_mock_ctx()
         with pytest.raises(ValueError, match="read-only"):
             await readonly_srv.sap_handle_popup(ctx)
+
+    @pytest.mark.asyncio
+    async def test_readonly_blocks_select_popup_table_row_and_confirm(self, readonly_srv):
+        """sap_select_popup_table_row_and_confirm raises in read-only mode."""
+        ctx = _make_mock_ctx()
+        with pytest.raises(ValueError, match="read-only"):
+            await readonly_srv.sap_select_popup_table_row_and_confirm(
+                "wnd[1]/usr/tbl",
+                0,
+                ctx,
+            )
 
     # Note: sap_disconnect is intentionally NOT blocked in read-only mode.
     # Disconnecting from a session should always be allowed.
@@ -647,11 +708,13 @@ class TestToolRegistration:
             "sap_get_session_info", "sap_disconnect",
             # Navigation
             "sap_execute_transaction", "sap_send_key", "sap_get_screen_info",
+            "sap_get_light_snapshot",
             # Field
             "sap_read_field", "sap_set_field", "sap_press_button",
             "sap_select_menu", "sap_select_checkbox", "sap_select_radio_button",
             "sap_select_combobox_entry", "sap_select_tab",
             "sap_get_combobox_entries", "sap_set_batch_fields",
+            "sap_set_fields_and_enter",
             "sap_read_textedit", "sap_set_textedit", "sap_set_focus",
             # Table (both types)
             "sap_read_table", "sap_select_table_row", "sap_double_click_cell",
@@ -669,6 +732,7 @@ class TestToolRegistration:
             "sap_select_multiple_rows",
             # Popup & dialog
             "sap_get_popup_window", "sap_handle_popup",
+            "sap_select_popup_table_row_and_confirm",
             # Toolbar discovery
             "sap_get_toolbar_buttons",
             # Shell content
@@ -721,6 +785,31 @@ class TestToolRegistration:
         assert "enum" in action_schema
         assert "auto" in action_schema["enum"]
 
+    @pytest.mark.asyncio
+    async def test_select_popup_table_row_and_confirm_uses_controller_workflow(self, srv):
+        """sap_select_popup_table_row_and_confirm forwards to controller workflow."""
+        ctx = _make_mock_ctx()
+        mock_ctrl = MagicMock()
+        mock_ctrl.select_popup_table_row_and_confirm.return_value = {
+            "status": "success",
+            "table_id": "wnd[1]/usr/tbl",
+            "selected_row": 0,
+            "screen": {"transaction": "MM03"},
+        }
+        with patch.object(srv, '_ctrl', return_value=mock_ctrl):
+            result = await srv.sap_select_popup_table_row_and_confirm(
+                "wnd[1]/usr/tbl",
+                0,
+                ctx,
+                confirm_action="auto",
+            )
+        mock_ctrl.select_popup_table_row_and_confirm.assert_called_once_with(
+            "wnd[1]/usr/tbl",
+            0,
+            confirm_action="auto",
+        )
+        assert result["status"] == "success"
+
     def test_sap_connect_schema_excludes_password(self, srv):
         """sap_connect should not expose a password parameter through MCP."""
         import asyncio
@@ -751,7 +840,7 @@ class TestToolRegistration:
         read_only_tools = {
             "sap_connect", "sap_connect_existing", "sap_list_connections",
             "sap_get_session_info", "sap_disconnect",
-            "sap_get_screen_info", "sap_read_field",
+            "sap_get_screen_info", "sap_get_light_snapshot", "sap_read_field",
             "sap_get_combobox_entries", "sap_read_textedit", "sap_read_table",
             "sap_get_alv_toolbar", "sap_get_column_info", "sap_get_current_cell",
             "sap_get_table_control_row_info", "sap_get_cell_info",

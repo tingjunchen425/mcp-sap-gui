@@ -333,15 +333,15 @@ These prevent common agent mistakes like guessing element IDs, ignoring popups, 
 
 ## Available Tools
 
-The server currently exposes **57 MCP tools**.
+The server currently exposes **60 MCP tools**.
 
 | Category | Count | What it covers |
 |---|---:|---|
 | Connection & Policy | 6 | Connect to SAP, attach to open sessions, inspect sessions, disconnect, set policy profile |
-| Navigation | 3 | Execute transactions, send keys, inspect current screen |
-| Fields & UI | 13 | Read/write fields, buttons, tabs, comboboxes, textedit, focus |
+| Navigation | 4 | Execute transactions, send keys, inspect current screen, read light snapshots |
+| Fields & UI | 14 | Read/write fields, buttons, tabs, comboboxes, textedit, focus, composite form fill |
 | Tables & Grids | 17 | ALV grids, TableControls, row selection, column info, cell ops |
-| Popup / Toolbar / Shell | 4 | Popup inspection and handling, toolbar discovery, shell content |
+| Popup / Toolbar / Shell | 5 | Popup inspection and handling, popup table row confirm, toolbar discovery, shell content |
 | Trees | 10 | Read/search/expand/select/click SAP tree controls |
 | Discovery | 2 | Screen element discovery and screenshots |
 | Workflow Guidance | 1 | Return step-by-step guidance for known multi-tool SAP workflows |
@@ -349,6 +349,9 @@ The server currently exposes **57 MCP tools**.
 
 The most important patterns:
 - `sap_get_screen_elements` to discover IDs instead of guessing
+- `sap_get_light_snapshot` for fast screen/popup/fingerprint checks when full element discovery is not needed
+- `sap_set_fields_and_enter` for multi-field form fill followed by Enter validation in one call
+- `sap_select_popup_table_row_and_confirm` for table-row popup choices followed by confirm in one call
 - `sap_read_table` to start with any SAP table/grid
 - `sap_get_popup_window` when `active_window` reports a popup; it now classifies the dialog and suggests a safe next step
 - `sap_handle_popup(action="auto")` when you want the server to dismiss only clearly safe informational popups and otherwise leave the dialog untouched

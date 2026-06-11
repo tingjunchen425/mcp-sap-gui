@@ -1,6 +1,6 @@
 # Tool Catalog
 
-`mcp-sap-gui` currently exposes **57 MCP tools**.
+`mcp-sap-gui` currently exposes **60 MCP tools**.
 
 Two practical rules:
 
@@ -45,6 +45,7 @@ Preferred usage: use `sap_connect_existing` when the user is already logged in t
 | `sap_execute_transaction` | Execute a transaction code such as `MM03`, `VA01`, or `/SCWM/MON` subject to the active transaction policy |
 | `sap_send_key` | Send SAP keys such as `Enter`, function keys, `Back`, or `Save`; `F11` / `Save` requires explicit confirmation via elicitation-capable clients |
 | `sap_get_screen_info` | Read current screen info including transaction, program, screen number, title, status, and active window |
+| `sap_get_light_snapshot` | Read a lightweight screen snapshot with screen info, active window, fingerprint, and popup summary without enumerating all elements |
 
 ## Fields And UI Elements
 
@@ -60,6 +61,7 @@ Preferred usage: use `sap_connect_existing` when the user is already logged in t
 | `sap_select_tab` | Select a tab strip tab |
 | `sap_get_combobox_entries` | List combobox entries |
 | `sap_set_batch_fields` | Set multiple fields in one call, with optional `validate` and `skip_readonly` support for safer form fill |
+| `sap_set_fields_and_enter` | Set multiple fields and send Enter validation in one workflow-level call |
 | `sap_read_textedit` | Read a multiline text editor |
 | `sap_set_textedit` | Set a multiline text editor |
 | `sap_set_focus` | Set focus to a screen element |
@@ -109,6 +111,7 @@ Preferred usage: use `sap_connect_existing` when the user is already logged in t
 |------|-------------|
 | `sap_get_popup_window` | Read popup title, text, buttons, and classification so the agent can tell confirmation from information or input-required dialogs |
 | `sap_handle_popup` | Read and act on popups in one call, including `confirm`, `cancel`, `press`, and safe `auto` handling with post-action verification |
+| `sap_select_popup_table_row_and_confirm` | Select a row in a popup table and confirm the dialog in one workflow-level call |
 | `sap_get_toolbar_buttons` | List standard SAP toolbar buttons |
 | `sap_read_shell_content` | Read content from shell-based controls such as HTML viewers |
 
@@ -169,9 +172,16 @@ Preferred usage: use `sap_connect_existing` when the user is already logged in t
 
 ### Form Fill
 
-1. Use `sap_set_batch_fields` for multi-field input instead of repeated single-field writes
-2. Add `skip_readonly=true` when the screen may include display-only fields
-3. Add `validate=true` when you want SAP to process the input with Enter and return post-validation screen feedback
+1. Use `sap_set_fields_and_enter` when the next action is Enter validation after filling multiple fields
+2. Use `sap_set_batch_fields` for multi-field input that should not submit the screen yet
+3. Add `skip_readonly=true` when the screen may include display-only fields
+4. Add `validate=true` to `sap_set_batch_fields` only when you need the older split workflow instead of the composite tool
+
+### Popup Table Selection
+
+1. Use `sap_select_popup_table_row_and_confirm` when a popup table row choice is immediately followed by Continue/Enter
+2. Use `sap_get_popup_window` first when the popup type or target table is unknown
+3. Fall back to `sap_select_table_row` plus `sap_handle_popup` if the composite tool is unavailable
 
 ### SPRO Or Tree Navigation
 
