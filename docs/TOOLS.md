@@ -1,6 +1,6 @@
 # Tool Catalog
 
-`mcp-sap-gui` currently exposes **60 MCP tools**.
+`mcp-sap-gui` currently exposes **61 MCP tools**.
 
 Two practical rules:
 
@@ -78,6 +78,7 @@ Preferred usage: use `sap_connect_existing` when the user is already logged in t
 | Tool | Description |
 |------|-------------|
 | `sap_read_table` | Read rows and columns from a table or grid |
+| `sap_inspect_tables` | Locate deep or focused table/grid controls, then read schema-first diagnostics |
 | `sap_select_table_row` | Select a row |
 | `sap_double_click_cell` | Double-click a cell |
 | `sap_modify_cell` | Modify an editable cell |

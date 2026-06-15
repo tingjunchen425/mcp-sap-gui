@@ -21,6 +21,279 @@ class TablesMixin:
     # Table/Grid Operations
     # =========================================================================
 
+    _TABLE_CANDIDATE_TYPES = {
+        "GuiGridView",
+        "GuiCtrlGridView",
+        "GuiTableControl",
+        "GuiShell",
+    }
+    _TABLE_ID_PATTERNS = (
+        "/tbl",
+        "tbl",
+        "grid",
+        "alv",
+        "shellcont/shell",
+        "cntl",
+    )
+
+    def _short_sap_id(self, value: Any) -> str:
+        """Normalize a full SAP COM id to the scripting id starting at wnd[n]."""
+        text = str(value or "")
+        start = text.find("wnd[")
+        if start < 0:
+            return text
+        return text[start:]
+
+    def _element_brief(self, element) -> Dict[str, Any]:
+        """Return a compact, JSON-safe description of a SAP GUI element."""
+        if element is None:
+            return {}
+        return {
+            "id": self._short_sap_id(getattr(element, "Id", "")),
+            "type": str(getattr(element, "Type", "") or ""),
+            "name": str(getattr(element, "Name", "") or ""),
+            "text": str(getattr(element, "Text", "") or "")[:200],
+        }
+
+    def _get_focused_element_info(self) -> Dict[str, Any]:
+        """Read the currently focused SAP element/control, including ActiveX focus."""
+        self._require_session()
+        containers = []
+        try:
+            containers.append(self._session.ActiveWindow)
+        except Exception:
+            pass
+        try:
+            containers.append(self._session.findById("wnd[0]"))
+        except Exception:
+            pass
+
+        for container in containers:
+            if container is None:
+                continue
+            for attr in ("GuiFocus", "SystemFocus", "Focus"):
+                try:
+                    focus = getattr(container, attr)
+                except Exception:
+                    focus = None
+                if focus is None:
+                    continue
+                info = self._element_brief(focus)
+                if info.get("id"):
+                    info["focus_attr"] = attr
+                    return info
+        return {}
+
+    def _parent_chain_candidates(self, element) -> List[Dict[str, Any]]:
+        """Collect parent objects from a focused child cell/control."""
+        candidates = []
+        seen = set()
+        current = element
+        depth = 0
+        while current is not None and depth < 12:
+            info = self._element_brief(current)
+            element_id = info.get("id", "")
+            if element_id and element_id not in seen:
+                seen.add(element_id)
+                info["candidate_source"] = "focus_parent"
+                candidates.append(info)
+            try:
+                current = getattr(current, "Parent")
+            except Exception:
+                current = None
+            depth += 1
+        return candidates
+
+    def _id_parent_candidates(self, element_id: str) -> List[Dict[str, Any]]:
+        """Generate likely table ids by trimming a focused child id."""
+        candidates = []
+        seen = set()
+        parts = [part for part in str(element_id or "").split("/") if part]
+        for index in range(len(parts), 1, -1):
+            candidate_id = "/".join(parts[:index])
+            lowered = candidate_id.lower()
+            if not any(pattern in lowered for pattern in self._TABLE_ID_PATTERNS):
+                continue
+            if candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            candidates.append({
+                "id": candidate_id,
+                "type": "",
+                "name": "",
+                "text": "",
+                "candidate_source": "focus_id_parent",
+            })
+        return candidates
+
+    def _looks_like_table_candidate(self, info: Dict[str, Any]) -> bool:
+        element_type = str(info.get("type") or "")
+        if element_type in self._TABLE_CANDIDATE_TYPES:
+            return True
+        blob = " ".join([
+            str(info.get("id") or ""),
+            str(info.get("name") or ""),
+            str(info.get("text") or ""),
+        ]).lower()
+        return any(pattern in blob for pattern in self._TABLE_ID_PATTERNS)
+
+    def _find_table_candidates(
+        self,
+        container_id: str = "wnd[0]/usr",
+        max_depth: int = 10,
+        use_focus: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Find table/grid candidates from focus, parents, and element discovery."""
+        self._require_session()
+        candidates: List[Dict[str, Any]] = []
+        seen = set()
+
+        def add(info: Dict[str, Any], source: str = "") -> None:
+            if not info:
+                return
+            element_id = self._short_sap_id(info.get("id", ""))
+            if not element_id or element_id in seen:
+                return
+            info = dict(info)
+            info["id"] = element_id
+            if source and not info.get("candidate_source"):
+                info["candidate_source"] = source
+            if not self._looks_like_table_candidate(info):
+                return
+            seen.add(element_id)
+            candidates.append(info)
+
+        if use_focus:
+            focused_obj = None
+            focus_containers = []
+            try:
+                focus_containers.append(self._session.ActiveWindow)
+            except Exception:
+                pass
+            try:
+                focus_containers.append(self._session.findById("wnd[0]"))
+            except Exception:
+                pass
+            for container in focus_containers:
+                if container is None:
+                    continue
+                for attr in ("GuiFocus", "SystemFocus", "Focus"):
+                    try:
+                        focused_obj = getattr(container, attr)
+                    except Exception:
+                        focused_obj = None
+                    if focused_obj is not None:
+                        break
+                if focused_obj is not None:
+                    break
+            focused_info = self._element_brief(focused_obj)
+            focused_id = focused_info.get("id", "")
+            if focused_info:
+                focused_info["candidate_source"] = "focus"
+                add(focused_info)
+            for item in self._parent_chain_candidates(focused_obj):
+                add(item)
+            for item in self._id_parent_candidates(focused_id):
+                add(item)
+
+        try:
+            container = self._find_element(container_id)
+            elements = self._enumerate_elements(
+                container,
+                max_depth,
+                type_filter_set=None,
+                changeable_only=False,
+            )
+            for element in elements:
+                add({
+                    "id": element.id,
+                    "type": element.type,
+                    "name": element.name,
+                    "text": element.text,
+                    "candidate_source": "element_discovery",
+                })
+        except Exception as exc:
+            candidates.append({
+                "id": "",
+                "type": "discovery_error",
+                "name": "",
+                "text": str(exc),
+                "candidate_source": "element_discovery",
+            })
+
+        priority = {"GuiGridView": 0, "GuiCtrlGridView": 0, "GuiTableControl": 1, "GuiShell": 2}
+        candidates.sort(key=lambda item: (
+            priority.get(str(item.get("type") or ""), 3),
+            0 if str(item.get("candidate_source") or "").startswith("focus") else 1,
+            len(str(item.get("id") or "")),
+        ))
+        return candidates
+
+    def inspect_tables(
+        self,
+        container_id: str = "wnd[0]/usr",
+        max_depth: int = 10,
+        max_rows: int = 10,
+        include_rows: bool = False,
+        use_focus: bool = True,
+    ) -> Dict[str, Any]:
+        """Locate readable SAP tables/grids and read their schemas.
+
+        This is a diagnostic/composite helper for screens where a normal
+        element scan misses deep Enjoy/ActiveX table controls. It combines:
+        focused-control probing, parent-id probing, broad element discovery,
+        and schema-first sap_read_table attempts.
+        """
+        self._require_session()
+        candidates = self._find_table_candidates(container_id, max_depth, use_focus)
+        tables = []
+        errors = []
+        seen_tables = set()
+
+        for candidate in candidates:
+            table_id = candidate.get("id", "")
+            if not table_id or table_id in seen_tables:
+                if candidate.get("type") == "discovery_error":
+                    errors.append(candidate)
+                continue
+            seen_tables.add(table_id)
+            schema = self.read_table(table_id, max_rows=1, columns_only=True, start_row=0)
+            if schema.get("error"):
+                errors.append({
+                    "table_id": table_id,
+                    "type": candidate.get("type", ""),
+                    "source": candidate.get("candidate_source", ""),
+                    "phase": "schema",
+                    "error": schema.get("error", ""),
+                })
+                continue
+            if not schema.get("columns") and not schema.get("column_info"):
+                continue
+            schema["candidate_source"] = candidate.get("candidate_source", "")
+            schema["source_element_type"] = candidate.get("type", "")
+            tables.append(schema)
+            if include_rows:
+                rows = self.read_table(
+                    table_id,
+                    max_rows=max_rows,
+                    columns_only=False,
+                    start_row=0,
+                )
+                if not rows.get("error"):
+                    rows["candidate_source"] = candidate.get("candidate_source", "")
+                    rows["source_element_type"] = candidate.get("type", "")
+                    tables[-1] = rows
+
+        return {
+            "screen": self.get_screen_info(),
+            "focused_element": self._get_focused_element_info(),
+            "container_id": container_id,
+            "candidate_count": len([item for item in candidates if item.get("id")]),
+            "candidates": candidates[:25],
+            "tables": tables,
+            "errors": errors[:25],
+        }
+
     # ---- GuiTableControl helpers ----
 
     def _get_table_control_columns(self, table) -> list:

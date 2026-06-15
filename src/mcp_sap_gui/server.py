@@ -987,6 +987,34 @@ async def sap_read_table(
 
 
 @mcp.tool(annotations=_READ_ONLY, tags=_TAGS_READ)
+async def sap_inspect_tables(
+    ctx: Context,
+    container_id: str = "wnd[0]/usr",
+    max_depth: int = 10,
+    max_rows: int = 10,
+    include_rows: bool = False,
+    use_focus: bool = True,
+) -> dict:
+    """Locate readable SAP tables/grids and return schema-first evidence.
+
+    Use this when sap_get_screen_elements did not expose the visible table.
+    It combines focused-control probing, parent-id probing, broad element
+    discovery, and sap_read_table(columns_only=true). If the user first clicks
+    a cell/header in the target table, use_focus=true can identify deeply nested
+    Enjoy/ActiveX controls that are missed by normal element scans.
+    """
+    c = _ctrl(ctx)
+    capped = min(max_rows, config.max_table_rows)
+    return await _com(lambda: c.inspect_tables(
+        container_id=container_id,
+        max_depth=max_depth,
+        max_rows=capped,
+        include_rows=include_rows,
+        use_focus=use_focus,
+    ))
+
+
+@mcp.tool(annotations=_READ_ONLY, tags=_TAGS_READ)
 async def sap_get_alv_toolbar(grid_id: str, ctx: Context) -> dict:
     """Get all toolbar buttons from an ALV grid.
 
