@@ -1818,6 +1818,11 @@ async def sap_analyze_delivery_block(order_number: str, ctx: Context) -> dict:
             _first_value_by_name(elements, ["NETWR"], r"[\d,.]+")
             or _first_value_after_label(elements, ["淨值", "Net value"], r"[\d,.]+")
         )
+        company_code = (
+            _first_value_by_name(elements, ["BUKRS"], r"[A-Z0-9]{2,}")
+            or _first_value_after_label(elements, ["公司代碼", "Company Code"], r"[A-Z0-9]{2,}")
+            or os.getenv("FBL5N_COMPANY_CODE", "").strip()
+        )
 
         if not material:
             switched = await _select_tab_by_text(elements, ["項目概觀", "Item overview", "Item Overview"])
@@ -1847,6 +1852,7 @@ async def sap_analyze_delivery_block(order_number: str, ctx: Context) -> dict:
             "customer": customer or "N/A",
             "material": material or "",
             "plant": plant or "",
+            "company_code": company_code or "",
             "net_value": net_value or "N/A",
             "status_texts": status_texts[:20],
             "document_flow": [
@@ -1855,7 +1861,7 @@ async def sap_analyze_delivery_block(order_number: str, ctx: Context) -> dict:
             ][:30],
         }
 
-    async def _check_credit_block() -> dict:
+    async def _check_credit_block(customer: str = "") -> dict:
         await _com(lambda: c.execute_transaction("VKM1"))
         set_result = await _set_first_available([
             "wnd[0]/usr/ctxtVBAK-VBELN",
@@ -1870,6 +1876,20 @@ async def sap_analyze_delivery_block(order_number: str, ctx: Context) -> dict:
             set_result = await _set_by_discovered_name(["VBELN", "S_VBELN", "SO_VBELN", "VBELN-LOW"], order_number)
         if not set_result.get("success"):
             set_result = await _set_after_label(["銷售文件", "銷售訂單", "Sales document", "Sales order"], order_number)
+        filter_basis = "sales_order" if set_result.get("success") else ""
+
+        if not set_result.get("success") and customer and customer != "N/A":
+            set_result = await _set_first_available([
+                "wnd[0]/usr/ctxtKNKLI-LOW",
+                "wnd[0]/usr/txtKNKLI-LOW",
+                "/app/con[0]/ses[0]/wnd[0]/usr/ctxtKNKLI-LOW",
+            ], customer)
+            if not set_result.get("success"):
+                set_result = await _set_by_discovered_name(["KNKLI", "KNKLI-LOW"], customer)
+            if not set_result.get("success"):
+                set_result = await _set_after_label(["信用帳戶", "客戶", "Credit account", "Credit account number"], customer)
+            if set_result.get("success"):
+                filter_basis = "customer_credit_account"
 
         if set_result.get("success"):
             await _com(lambda: c.send_vkey(8))
@@ -1890,14 +1910,16 @@ async def sap_analyze_delivery_block(order_number: str, ctx: Context) -> dict:
                 })
         has_order = _contains_any(texts, [order_number])
         has_credit_signal = _contains_any(texts, ["信用", "credit", "凍結", "block", "blocked", "exceeded", "超過"])
+        blocked = bool(has_credit_signal and (has_order or filter_basis == "customer_credit_account"))
         return {
             "checked": True,
             "filter_set": bool(set_result.get("success")),
-            "blocked": bool(has_order and has_credit_signal),
-            "confidence": "high" if has_order and has_credit_signal else ("medium" if has_credit_signal else "low"),
+            "filter_basis": filter_basis,
+            "blocked": blocked,
+            "confidence": "high" if has_order and has_credit_signal else ("medium" if blocked else ("medium" if has_credit_signal else "low")),
             "filter_detail": set_result,
             "editable_fields": editable_fields[:30],
-            "evidence": [text for text in texts if any(k.lower() in text.lower() for k in [order_number, "信用", "credit", "凍結", "block", "超過"])][:20],
+            "evidence": [text for text in texts if any(k.lower() in text.lower() for k in [order_number, customer, "信用", "credit", "凍結", "block", "超過"])][:20],
         }
 
     async def _check_stock(material: str, plant: str) -> dict:
@@ -1951,6 +1973,104 @@ async def sap_analyze_delivery_block(order_number: str, ctx: Context) -> dict:
             "evidence": [text for text in texts if any(k.lower() in text.lower() for k in ["短缺", "缺料", "shortage", "不足", "exception", "例外", material])][:25],
         }
 
+    async def _check_customer_ar(customer: str, company_code: str = "") -> dict:
+        if not customer or customer == "N/A":
+            return {
+                "checked": False,
+                "overdue_signal": None,
+                "confidence": "low",
+                "reason": "VA03 未抓到買方/客戶，無法自動執行 FBL5N。",
+            }
+
+        company_code = (company_code or os.getenv("FBL5N_COMPANY_CODE", "")).strip()
+        await _com(lambda: c.execute_transaction("FBL5N"))
+        customer_result = await _set_first_available([
+            "wnd[0]/usr/ctxtDD_KUNNR-LOW",
+            "wnd[0]/usr/ctxtKUNNR-LOW",
+            "wnd[0]/usr/ctxtS_KUNNR-LOW",
+            "wnd[0]/usr/txtDD_KUNNR-LOW",
+        ], customer)
+        if not customer_result.get("success"):
+            customer_result = await _set_by_discovered_name(["DD_KUNNR", "KUNNR", "KUNNR-LOW"], customer)
+        if not customer_result.get("success"):
+            customer_result = await _set_after_label(["客戶帳戶", "客戶", "Customer account", "Customer"], customer)
+
+        company_result = {"success": False, "detail": "company code not provided"}
+        if company_code:
+            company_result = await _set_first_available([
+                "wnd[0]/usr/ctxtDD_BUKRS-LOW",
+                "wnd[0]/usr/ctxtBUKRS-LOW",
+                "wnd[0]/usr/ctxtS_BUKRS-LOW",
+                "wnd[0]/usr/txtDD_BUKRS-LOW",
+            ], company_code)
+            if not company_result.get("success"):
+                company_result = await _set_by_discovered_name(["DD_BUKRS", "BUKRS", "BUKRS-LOW"], company_code)
+            if not company_result.get("success"):
+                company_result = await _set_after_label(["公司代碼", "Company Code"], company_code)
+
+        if not customer_result.get("success"):
+            editable_elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=8, changeable_only=True))
+            editable_fields = []
+            for elem in editable_elements or []:
+                elem_type = getattr(elem, "type", "")
+                if elem_type not in {"GuiTextField", "GuiCTextField", "GuiComboBox"}:
+                    continue
+                editable_fields.append({
+                    "id": getattr(elem, "id", ""),
+                    "name": getattr(elem, "name", ""),
+                    "type": elem_type,
+                    "text": _clean_text(getattr(elem, "text", "")),
+                })
+            return {
+                "checked": False,
+                "overdue_signal": None,
+                "confidence": "low",
+                "reason": "FBL5N 客戶欄位無法自動填入。",
+                "customer": customer,
+                "company_code": company_code,
+                "customer_field": customer_result,
+                "company_field": company_result,
+                "editable_fields": editable_fields[:30],
+            }
+
+        await _com(lambda: c.send_vkey(8))
+        elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=8))
+        texts = _element_texts(elements)
+        table_evidence = []
+        table_elements = [
+            elem for elem in elements or []
+            if getattr(elem, "type", "") in {"GuiTableControl", "GuiGridView"}
+        ]
+        for table_elem in table_elements[:3]:
+            table = await _com(lambda tid=table_elem.id: c.read_table(tid, max_rows=10))
+            if not isinstance(table, dict) or table.get("error"):
+                continue
+            for row in table.get("data", []) or []:
+                row_text = " | ".join(_clean_text(value) for value in row.values() if _clean_text(value))
+                if row_text:
+                    table_evidence.append(row_text)
+
+        combined_texts = texts + table_evidence
+        no_items = _contains_any(combined_texts, ["沒有項目", "無項目", "No items", "No line items", "not contain any items"])
+        open_signal = _contains_any(combined_texts, ["未清", "Open", "open item", "Line item", "項目"])
+        overdue_signal = _contains_any(combined_texts, ["逾期", "overdue", "arrears", "past due", "到期", "net due", "due date"])
+        return {
+            "checked": True,
+            "customer": customer,
+            "company_code": company_code or "N/A",
+            "filter_set": bool(customer_result.get("success")),
+            "company_filter_set": bool(company_result.get("success")) if company_code else False,
+            "open_item_signal": bool(open_signal and not no_items),
+            "overdue_signal": bool(overdue_signal and not no_items),
+            "confidence": "medium" if overdue_signal or open_signal else "low",
+            "customer_field": customer_result,
+            "company_field": company_result,
+            "evidence": [
+                text for text in combined_texts
+                if any(k.lower() in text.lower() for k in [customer, company_code, "逾期", "overdue", "未清", "open", "到期", "due"])
+            ][:25],
+        }
+
     va03 = await _collect_va03_evidence()
     if not va03.get("success"):
         return {
@@ -1960,8 +2080,9 @@ async def sap_analyze_delivery_block(order_number: str, ctx: Context) -> dict:
             "detail": va03,
         }
 
-    credit = await _check_credit_block()
+    credit = await _check_credit_block(va03.get("customer", ""))
     stock = await _check_stock(va03.get("material", ""), va03.get("plant", ""))
+    customer_ar = await _check_customer_ar(va03.get("customer", ""), va03.get("company_code", ""))
 
     findings = []
     if credit.get("blocked"):
@@ -1977,6 +2098,20 @@ async def sap_analyze_delivery_block(order_number: str, ctx: Context) -> dict:
             "severity": "high",
             "message": "疑似缺料或庫存可用量不足，MD04 出現短缺/例外相關訊息。",
             "evidence": stock.get("evidence", []),
+        })
+    if customer_ar.get("overdue_signal"):
+        findings.append({
+            "type": "customer_overdue_ar",
+            "severity": "medium",
+            "message": "FBL5N 顯示客戶可能存在逾期或到期未清帳款訊號。",
+            "evidence": customer_ar.get("evidence", []),
+        })
+    elif customer_ar.get("open_item_signal"):
+        findings.append({
+            "type": "customer_open_ar",
+            "severity": "info",
+            "message": "FBL5N 顯示客戶存在未清項目，但未抓到明確逾期訊號。",
+            "evidence": customer_ar.get("evidence", []),
         })
     if _contains_any(va03.get("status_texts", []), ["交貨凍結", "delivery block", "delivery blocked"]):
         findings.append({
@@ -2002,6 +2137,7 @@ async def sap_analyze_delivery_block(order_number: str, ctx: Context) -> dict:
             "va03": va03,
             "vkm1_credit": credit,
             "md04_stock": stock,
+            "fbl5n_ar": customer_ar,
         },
         "message": "已完成訂單卡關診斷",
     }
