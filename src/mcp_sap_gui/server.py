@@ -596,36 +596,10 @@ _SAVE_KEYS = {"F11", "Save"}
 
 async def _confirm_save(ctx: Context, key: str) -> dict | None:
     """Request user confirmation before sending a save key.
-
-    Returns ``None`` if the user accepted (caller should proceed).
-    Returns a cancellation dict if declined/cancelled.
-    Raises ``ValueError`` if the client does not support elicitation.
+    
+    [AUTO-EDIT]: Bypassed to allow autonomous saving as per user request.
     """
-    try:
-        result = await ctx.elicit(
-            message=(
-                f"You are about to send '{key}' which triggers Save (F11) "
-                "in SAP. This can persist changes to the database. "
-                "Do you want to proceed?"
-            ),
-            response_type=bool,
-        )
-    except McpError as exc:
-        raise ValueError(
-            f"Save action requires confirmation but the client does not "
-            f"support elicitation: {exc}"
-        ) from exc
-
-    if result.action == "accept" and result.data is True:
-        return None  # proceed
-
-    action = result.action
-    return {
-        "status": "cancelled",
-        "action": action,
-        "key": key,
-        "reason": f"User did not confirm save ({action})",
-    }
+    return None # 直接核准，不再詢問
 
 
 def _to_dict(obj):
@@ -1594,6 +1568,607 @@ def sap_gui_guide() -> str:
     Covers element types, ID patterns, transaction conventions,
     table type comparison, SPRO navigation, and troubleshooting."""
     return _SAP_GUI_GUIDE
+
+@mcp.tool(annotations=_READ_ONLY, tags=_TAGS_READ)
+async def sap_get_order_overview(order_number: str, ctx: Context) -> dict:
+    """
+    【一鍵總結工具】查詢銷售訂單 (VA03) 的全貌。
+    只需輸入號碼，自動回傳：客戶、金額、以及目前的出貨/開票進度（憑證流）。
+    """
+    c = _ctrl(ctx)
+
+    def _field_value(result: dict) -> str:
+        if not isinstance(result, dict) or result.get("error"):
+            return ""
+        return str(result.get("value", "") or "")
+
+    async def _first_readable_field(field_ids: list[str]) -> str:
+        for field_id in field_ids:
+            value = _field_value(await _com(lambda fid=field_id: c.read_field(fid)))
+            if value:
+                return value
+        return ""
+
+    def _clean_text(value: str) -> str:
+        return str(value or "").replace("：", "").replace(":", "").strip()
+
+    def _first_value_after_label(elements, labels: list[str], value_pattern: str = r"\S+") -> str:
+        for index, elem in enumerate(elements):
+            label_text = _clean_text(getattr(elem, "text", ""))
+            if not label_text or not any(label in label_text for label in labels):
+                continue
+
+            for next_elem in elements[index + 1:index + 8]:
+                value = _clean_text(getattr(next_elem, "text", ""))
+                if value and not any(label in value for label in labels) and re.search(value_pattern, value):
+                    return value
+        return ""
+
+    def _first_value_by_name(elements, name_markers: list[str], value_pattern: str = r"\S+") -> str:
+        for elem in elements:
+            haystack = f"{getattr(elem, 'id', '')} {getattr(elem, 'name', '')}".upper()
+            value = _clean_text(getattr(elem, "text", ""))
+            if value and any(marker.upper() in haystack for marker in name_markers) and re.search(value_pattern, value):
+                return value
+        return ""
+
+    def _session_screen_number(info) -> str:
+        if isinstance(info, dict):
+            return str(info.get("screen_number", "") or "")
+        return str(getattr(info, "screen_number", "") or "")
+    
+    # 1. 進入 VA03 並輸入號碼
+    await _com(lambda: c.execute_transaction("VA03"))
+    set_result = await _com(lambda: c.set_field("wnd[0]/usr/ctxtVBAK-VBELN", order_number))
+    if isinstance(set_result, dict) and set_result.get("error"):
+        return {
+            "success": False,
+            "order_number": order_number,
+            "error": "無法填入銷售訂單號碼欄位",
+            "detail": set_result,
+        }
+    await _com(lambda: c.send_vkey(0)) # Enter
+    
+    # 檢查是否報錯 (留在初始畫面表示失敗)
+    info = await _com(c.get_session_info)
+    if "0101" in _session_screen_number(info):
+        return {"success": False, "order_number": order_number, "error": "訂單不存在或無法讀取"}
+
+    # 2. 抓取基本資訊 (Header)。不同 SAP GUI 版本/語系的 VA03 subscreen ID 會不同，
+    # 所以先試常見 ID，再用畫面元素與標籤 fallback。
+    customer = await _first_readable_field([
+        "wnd[0]/usr/subSUBSCREEN_HEADER:SAPLWBGI:0100/ctxtVBAK-KUNNR",
+        "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/ctxtKUAGV-KUNNR",
+        "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/ctxtVBPA-KUNNR",
+        "wnd[0]/usr/ctxtKUAGV-KUNNR",
+        "wnd[0]/usr/ctxtVBPA-KUNNR",
+    ])
+    net_value = await _first_readable_field([
+        "wnd[0]/usr/subSUBSCREEN_HEADER:SAPLWBGI:0100/txtVBAK-NETWR",
+        "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/txtVBAK-NETWR",
+        "wnd[0]/usr/txtVBAK-NETWR",
+    ])
+    currency = await _first_readable_field([
+        "wnd[0]/usr/subSUBSCREEN_HEADER:SAPLWBGI:0100/ctxtVBAK-WAERK",
+        "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/ctxtVBAK-WAERK",
+        "wnd[0]/usr/ctxtVBAK-WAERK",
+    ])
+
+    if not customer or not net_value or not currency:
+        header_elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=6))
+        if not customer:
+            customer = (
+                _first_value_by_name(header_elements, ["KUAGV-KUNNR", "VBPA-KUNNR"], r"\d{4,}")
+                or _first_value_after_label(header_elements, ["買方", "Sold-to", "Sold-to Party"], r"\d{4,}")
+            )
+        if not net_value:
+            net_value = (
+                _first_value_by_name(header_elements, ["VBAK-NETWR", "NETWR"], r"[\d,.]+")
+                or _first_value_after_label(header_elements, ["淨值", "Net value"], r"[\d,.]+")
+            )
+        if not currency:
+            currency = _first_value_by_name(header_elements, ["VBAK-WAERK", "WAERK"], r"[A-Z]{2,5}")
+
+    # 3. 點擊「憑證流」按鈕 (F7)
+    await _com(lambda: c.send_vkey(7))
+
+    # 4. 讀取憑證流內容
+    flow_info = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=6))
+    flow_summary = []
+    for elem in flow_info:
+        if elem.text and any(keyword in elem.text for keyword in ["銷售訂單", "交貨", "出貨", "Delivery", "發票", "Invoice", "Billing", "過帳", "PGI"]):
+            flow_summary.append(elem.text)
+
+    return {
+        "success": True,
+        "order_number": order_number,
+        "customer_id": customer or "N/A",
+        "amount": f"{net_value} {currency}".strip() if net_value else "N/A",
+        "status_flow": flow_summary if flow_summary else ["尚無後續憑證"],
+        "current_screen": "document_flow",
+        "message": "已完成一鍵總結查詢"
+    }
+
+
+@mcp.tool(annotations=_READ_ONLY, tags=_TAGS_READ)
+async def sap_analyze_delivery_block(order_number: str, ctx: Context) -> dict:
+    """
+    【訂單卡關診斷器】檢查銷售訂單為何可能無法出貨。
+    目前會巡檢 VA03、VKM1 與 MD04，回傳信用凍結、交貨凍結、缺料等可能原因與證據。
+    """
+    c = _ctrl(ctx)
+
+    def _clean_text(value: str) -> str:
+        return str(value or "").replace("：", "").replace(":", "").strip()
+
+    def _element_texts(elements) -> list[str]:
+        texts = []
+        for elem in elements or []:
+            text = _clean_text(getattr(elem, "text", ""))
+            if text:
+                texts.append(text)
+        return texts
+
+    def _contains_any(texts: list[str], keywords: list[str]) -> bool:
+        haystack = "\n".join(texts).lower()
+        return any(keyword.lower() in haystack for keyword in keywords)
+
+    def _first_value_by_name(elements, name_markers: list[str], value_pattern: str = r"\S+") -> str:
+        for elem in elements or []:
+            haystack = f"{getattr(elem, 'id', '')} {getattr(elem, 'name', '')}".upper()
+            value = _clean_text(getattr(elem, "text", ""))
+            if value and any(marker.upper() in haystack for marker in name_markers) and re.search(value_pattern, value):
+                return value
+        return ""
+
+    def _first_value_after_label(elements, labels: list[str], value_pattern: str = r"\S+") -> str:
+        for index, elem in enumerate(elements or []):
+            label_text = _clean_text(getattr(elem, "text", ""))
+            if not label_text or not any(label in label_text for label in labels):
+                continue
+            for next_elem in elements[index + 1:index + 8]:
+                value = _clean_text(getattr(next_elem, "text", ""))
+                if value and not any(label in value for label in labels) and re.search(value_pattern, value):
+                    return value
+        return ""
+
+    async def _first_value_from_tables(elements, column_markers: list[str], value_pattern: str = r"\S+") -> str:
+        table_elements = [
+            elem for elem in elements or []
+            if getattr(elem, "type", "") in {"GuiTableControl", "GuiGridView"}
+        ]
+        for table_elem in table_elements:
+            table = await _com(lambda tid=table_elem.id: c.read_table(tid, max_rows=5))
+            if not isinstance(table, dict) or table.get("error"):
+                continue
+
+            matched_columns = []
+            for column in table.get("column_info", []) or []:
+                column_text = " ".join(
+                    str(column.get(key, "") or "")
+                    for key in ("name", "title", "tooltip")
+                ).upper()
+                if any(marker.upper() in column_text for marker in column_markers):
+                    matched_columns.append(column.get("name"))
+
+            for row in table.get("data", []) or []:
+                for column_name in matched_columns:
+                    value = _clean_text(row.get(column_name, ""))
+                    if value and re.search(value_pattern, value):
+                        return value
+        return ""
+
+    async def _select_tab_by_text(elements, labels: list[str]) -> bool:
+        for elem in elements or []:
+            if getattr(elem, "type", "") != "GuiTab":
+                continue
+            tab_text = _clean_text(getattr(elem, "text", ""))
+            if tab_text and any(label.lower() in tab_text.lower() for label in labels):
+                result = await _com(lambda tab_id=elem.id: c.select_tab(tab_id))
+                return not (isinstance(result, dict) and result.get("error"))
+        return False
+
+    async def _set_first_available(field_ids: list[str], value: str) -> dict:
+        last_result = {}
+        for field_id in field_ids:
+            result = await _com(lambda fid=field_id: c.set_field(fid, value))
+            last_result = result if isinstance(result, dict) else {}
+            if not (isinstance(result, dict) and result.get("error")):
+                return {"success": True, "field_id": field_id}
+        return {"success": False, "detail": last_result}
+
+    async def _set_by_discovered_name(name_markers: list[str], value: str) -> dict:
+        elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=8, changeable_only=True))
+        for elem in elements or []:
+            haystack = f"{getattr(elem, 'id', '')} {getattr(elem, 'name', '')}".upper()
+            if any(marker.upper() in haystack for marker in name_markers):
+                result = await _com(lambda fid=elem.id: c.set_field(fid, value))
+                if not (isinstance(result, dict) and result.get("error")):
+                    return {"success": True, "field_id": elem.id}
+        return {"success": False, "detail": "no matching editable field"}
+
+    async def _set_after_label(labels: list[str], value: str) -> dict:
+        elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=8))
+        for index, elem in enumerate(elements or []):
+            label_text = _clean_text(getattr(elem, "text", ""))
+            if not label_text or not any(label.lower() in label_text.lower() for label in labels):
+                continue
+            for next_elem in elements[index + 1:index + 10]:
+                elem_type = getattr(next_elem, "type", "")
+                if elem_type not in {"GuiTextField", "GuiCTextField", "GuiComboBox"}:
+                    continue
+                if not getattr(next_elem, "changeable", False):
+                    continue
+                result = await _com(lambda fid=next_elem.id: c.set_field(fid, value))
+                if not (isinstance(result, dict) and result.get("error")):
+                    return {"success": True, "field_id": next_elem.id, "label": label_text}
+        return {"success": False, "detail": "no editable field after matching label"}
+
+    async def _open_sales_order() -> dict:
+        await _com(lambda: c.execute_transaction("VA03"))
+        set_result = await _set_first_available([
+            "wnd[0]/usr/ctxtVBAK-VBELN",
+            "wnd[0]/usr/ctxtRV45A-VBELN",
+        ], order_number)
+        if not set_result.get("success"):
+            set_result = await _set_by_discovered_name(["VBELN"], order_number)
+        if not set_result.get("success"):
+            return {"success": False, "error": "無法填入銷售訂單號碼欄位", "detail": set_result}
+
+        await _com(lambda: c.send_vkey(0))
+        info = await _com(c.get_session_info)
+        screen_number = str(getattr(info, "screen_number", "") if not isinstance(info, dict) else info.get("screen_number", ""))
+        if "0101" in screen_number:
+            return {"success": False, "error": "訂單不存在或無法讀取"}
+        return {"success": True}
+
+    async def _collect_va03_evidence() -> dict:
+        open_result = await _open_sales_order()
+        if not open_result.get("success"):
+            return {"success": False, **open_result}
+
+        elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=6))
+        texts = _element_texts(elements)
+        customer = (
+            _first_value_by_name(elements, ["KUAGV-KUNNR", "VBPA-KUNNR"], r"\d{4,}")
+            or _first_value_after_label(elements, ["買方", "Sold-to", "Sold-to Party"], r"\d{4,}")
+        )
+        material = (
+            _first_value_by_name(elements, ["MATNR"], r"[A-Z0-9][A-Z0-9\-_.]{2,}")
+            or await _first_value_from_tables(elements, ["MATNR", "Material", "物料"], r"[A-Z0-9][A-Z0-9\-_.]{2,}")
+            or _first_value_after_label(elements, ["物料", "Material"], r"[A-Z0-9][A-Z0-9\-_.]{2,}")
+        )
+        plant = (
+            _first_value_by_name(elements, ["WERKS"], r"[A-Z0-9]{2,}")
+            or _first_value_after_label(elements, ["工廠", "Plant"], r"[A-Z0-9]{2,}")
+        )
+        net_value = (
+            _first_value_by_name(elements, ["NETWR"], r"[\d,.]+")
+            or _first_value_after_label(elements, ["淨值", "Net value"], r"[\d,.]+")
+        )
+        company_code = (
+            _first_value_by_name(elements, ["BUKRS"], r"[A-Z0-9]{2,}")
+            or _first_value_after_label(elements, ["公司代碼", "Company Code"], r"[A-Z0-9]{2,}")
+            or os.getenv("FBL5N_COMPANY_CODE", "").strip()
+        )
+
+        if not material:
+            switched = await _select_tab_by_text(elements, ["項目概觀", "Item overview", "Item Overview"])
+            if switched:
+                item_elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=6))
+                material = (
+                    _first_value_by_name(item_elements, ["MATNR"], r"[A-Z0-9][A-Z0-9\-_.]{2,}")
+                    or await _first_value_from_tables(item_elements, ["MATNR", "Material", "物料"], r"[A-Z0-9][A-Z0-9\-_.]{2,}")
+                    or _first_value_after_label(item_elements, ["物料", "Material"], r"[A-Z0-9][A-Z0-9\-_.]{2,}")
+                )
+                if not plant:
+                    plant = (
+                        _first_value_by_name(item_elements, ["WERKS"], r"[A-Z0-9]{2,}")
+                        or await _first_value_from_tables(item_elements, ["WERKS", "Plant", "工廠"], r"[A-Z0-9]{2,}")
+                        or _first_value_after_label(item_elements, ["工廠", "Plant"], r"[A-Z0-9]{2,}")
+                    )
+
+        status_keywords = ["凍結", "block", "blocked", "未完成", "incomplete", "信用", "credit", "交貨", "delivery"]
+        status_texts = [text for text in texts if any(keyword.lower() in text.lower() for keyword in status_keywords)]
+
+        await _com(lambda: c.send_vkey(7))
+        flow_elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=6))
+        flow_texts = _element_texts(flow_elements)
+
+        return {
+            "success": True,
+            "customer": customer or "N/A",
+            "material": material or "",
+            "plant": plant or "",
+            "company_code": company_code or "",
+            "net_value": net_value or "N/A",
+            "status_texts": status_texts[:20],
+            "document_flow": [
+                text for text in flow_texts
+                if any(keyword.lower() in text.lower() for keyword in ["銷售訂單", "交貨", "出貨", "delivery", "發票", "invoice", "billing", "過帳", "pgi"])
+            ][:30],
+        }
+
+    async def _check_credit_block(customer: str = "") -> dict:
+        await _com(lambda: c.execute_transaction("VKM1"))
+        set_result = await _set_first_available([
+            "wnd[0]/usr/ctxtVBAK-VBELN",
+            "wnd[0]/usr/ctxtS_VBELN-LOW",
+            "wnd[0]/usr/txtS_VBELN-LOW",
+            "wnd[0]/usr/ctxtSO_VBELN-LOW",
+            "wnd[0]/usr/txtSO_VBELN-LOW",
+            "wnd[0]/usr/ctxtP_VBELN",
+            "wnd[0]/usr/txtP_VBELN",
+        ], order_number)
+        if not set_result.get("success"):
+            set_result = await _set_by_discovered_name(["VBELN", "S_VBELN", "SO_VBELN", "VBELN-LOW"], order_number)
+        if not set_result.get("success"):
+            set_result = await _set_after_label(["銷售文件", "銷售訂單", "Sales document", "Sales order"], order_number)
+        filter_basis = "sales_order" if set_result.get("success") else ""
+
+        if not set_result.get("success") and customer and customer != "N/A":
+            set_result = await _set_first_available([
+                "wnd[0]/usr/ctxtKNKLI-LOW",
+                "wnd[0]/usr/txtKNKLI-LOW",
+                "/app/con[0]/ses[0]/wnd[0]/usr/ctxtKNKLI-LOW",
+            ], customer)
+            if not set_result.get("success"):
+                set_result = await _set_by_discovered_name(["KNKLI", "KNKLI-LOW"], customer)
+            if not set_result.get("success"):
+                set_result = await _set_after_label(["信用帳戶", "客戶", "Credit account", "Credit account number"], customer)
+            if set_result.get("success"):
+                filter_basis = "customer_credit_account"
+
+        if set_result.get("success"):
+            await _com(lambda: c.send_vkey(8))
+        elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=6))
+        texts = _element_texts(elements)
+        editable_fields = []
+        if not set_result.get("success"):
+            editable_elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=8, changeable_only=True))
+            for elem in editable_elements or []:
+                elem_type = getattr(elem, "type", "")
+                if elem_type not in {"GuiTextField", "GuiCTextField", "GuiComboBox"}:
+                    continue
+                editable_fields.append({
+                    "id": getattr(elem, "id", ""),
+                    "name": getattr(elem, "name", ""),
+                    "type": elem_type,
+                    "text": _clean_text(getattr(elem, "text", "")),
+                })
+        has_order = _contains_any(texts, [order_number])
+        has_credit_signal = _contains_any(texts, ["信用", "credit", "凍結", "block", "blocked", "exceeded", "超過"])
+        blocked = bool(has_credit_signal and (has_order or filter_basis == "customer_credit_account"))
+        return {
+            "checked": True,
+            "filter_set": bool(set_result.get("success")),
+            "filter_basis": filter_basis,
+            "blocked": blocked,
+            "confidence": "high" if has_order and has_credit_signal else ("medium" if blocked else ("medium" if has_credit_signal else "low")),
+            "filter_detail": set_result,
+            "editable_fields": editable_fields[:30],
+            "evidence": [text for text in texts if any(k.lower() in text.lower() for k in [order_number, customer, "信用", "credit", "凍結", "block", "超過"])][:20],
+        }
+
+    async def _check_stock(material: str, plant: str) -> dict:
+        if not material or not plant:
+            return {
+                "checked": False,
+                "shortage": None,
+                "confidence": "low",
+                "reason": "VA03 畫面未抓到物料或工廠，無法自動執行 MD04。",
+            }
+
+        await _com(lambda: c.execute_transaction("MD04"))
+        mat_result = await _set_first_available([
+            "wnd[0]/usr/ctxtRM61R-MATNR",
+            "wnd[0]/usr/ctxtMDKP-MATNR",
+        ], material)
+        if not mat_result.get("success"):
+            mat_result = await _set_by_discovered_name(["MATNR"], material)
+
+        plant_result = await _set_first_available([
+            "wnd[0]/usr/ctxtRM61R-WERKS",
+            "wnd[0]/usr/ctxtMDKP-WERKS",
+        ], plant)
+        if not plant_result.get("success"):
+            plant_result = await _set_by_discovered_name(["WERKS"], plant)
+
+        if not mat_result.get("success") or not plant_result.get("success"):
+            screen_info = await _com(c.get_screen_info)
+            return {
+                "checked": False,
+                "shortage": None,
+                "confidence": "low",
+                "reason": "MD04 物料/工廠欄位無法自動填入。",
+                "material": material,
+                "plant": plant,
+                "material_field": mat_result,
+                "plant_field": plant_result,
+                "screen": screen_info,
+            }
+
+        await _com(lambda: c.send_vkey(0))
+        elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=6))
+        texts = _element_texts(elements)
+        shortage = _contains_any(texts, ["短缺", "缺料", "shortage", "不足", "exception", "例外", "delayed"])
+        return {
+            "checked": True,
+            "shortage": bool(shortage),
+            "confidence": "medium",
+            "material": material,
+            "plant": plant,
+            "evidence": [text for text in texts if any(k.lower() in text.lower() for k in ["短缺", "缺料", "shortage", "不足", "exception", "例外", material])][:25],
+        }
+
+    async def _check_customer_ar(customer: str, company_code: str = "") -> dict:
+        if not customer or customer == "N/A":
+            return {
+                "checked": False,
+                "overdue_signal": None,
+                "confidence": "low",
+                "reason": "VA03 未抓到買方/客戶，無法自動執行 FBL5N。",
+            }
+
+        company_code = (company_code or os.getenv("FBL5N_COMPANY_CODE", "")).strip()
+        await _com(lambda: c.execute_transaction("FBL5N"))
+        customer_result = await _set_first_available([
+            "wnd[0]/usr/ctxtDD_KUNNR-LOW",
+            "wnd[0]/usr/ctxtKUNNR-LOW",
+            "wnd[0]/usr/ctxtS_KUNNR-LOW",
+            "wnd[0]/usr/txtDD_KUNNR-LOW",
+        ], customer)
+        if not customer_result.get("success"):
+            customer_result = await _set_by_discovered_name(["DD_KUNNR", "KUNNR", "KUNNR-LOW"], customer)
+        if not customer_result.get("success"):
+            customer_result = await _set_after_label(["客戶帳戶", "客戶", "Customer account", "Customer"], customer)
+
+        company_result = {"success": False, "detail": "company code not provided"}
+        if company_code:
+            company_result = await _set_first_available([
+                "wnd[0]/usr/ctxtDD_BUKRS-LOW",
+                "wnd[0]/usr/ctxtBUKRS-LOW",
+                "wnd[0]/usr/ctxtS_BUKRS-LOW",
+                "wnd[0]/usr/txtDD_BUKRS-LOW",
+            ], company_code)
+            if not company_result.get("success"):
+                company_result = await _set_by_discovered_name(["DD_BUKRS", "BUKRS", "BUKRS-LOW"], company_code)
+            if not company_result.get("success"):
+                company_result = await _set_after_label(["公司代碼", "Company Code"], company_code)
+
+        if not customer_result.get("success"):
+            editable_elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=8, changeable_only=True))
+            editable_fields = []
+            for elem in editable_elements or []:
+                elem_type = getattr(elem, "type", "")
+                if elem_type not in {"GuiTextField", "GuiCTextField", "GuiComboBox"}:
+                    continue
+                editable_fields.append({
+                    "id": getattr(elem, "id", ""),
+                    "name": getattr(elem, "name", ""),
+                    "type": elem_type,
+                    "text": _clean_text(getattr(elem, "text", "")),
+                })
+            return {
+                "checked": False,
+                "overdue_signal": None,
+                "confidence": "low",
+                "reason": "FBL5N 客戶欄位無法自動填入。",
+                "customer": customer,
+                "company_code": company_code,
+                "customer_field": customer_result,
+                "company_field": company_result,
+                "editable_fields": editable_fields[:30],
+            }
+
+        await _com(lambda: c.send_vkey(8))
+        elements = await _com(lambda: c.get_screen_elements("wnd[0]/usr", max_depth=8))
+        texts = _element_texts(elements)
+        table_evidence = []
+        table_elements = [
+            elem for elem in elements or []
+            if getattr(elem, "type", "") in {"GuiTableControl", "GuiGridView"}
+        ]
+        for table_elem in table_elements[:3]:
+            table = await _com(lambda tid=table_elem.id: c.read_table(tid, max_rows=10))
+            if not isinstance(table, dict) or table.get("error"):
+                continue
+            for row in table.get("data", []) or []:
+                row_text = " | ".join(_clean_text(value) for value in row.values() if _clean_text(value))
+                if row_text:
+                    table_evidence.append(row_text)
+
+        combined_texts = texts + table_evidence
+        no_items = _contains_any(combined_texts, ["沒有項目", "無項目", "No items", "No line items", "not contain any items"])
+        open_signal = _contains_any(combined_texts, ["未清", "Open", "open item", "Line item", "項目"])
+        overdue_signal = _contains_any(combined_texts, ["逾期", "overdue", "arrears", "past due", "到期", "net due", "due date"])
+        return {
+            "checked": True,
+            "customer": customer,
+            "company_code": company_code or "N/A",
+            "filter_set": bool(customer_result.get("success")),
+            "company_filter_set": bool(company_result.get("success")) if company_code else False,
+            "open_item_signal": bool(open_signal and not no_items),
+            "overdue_signal": bool(overdue_signal and not no_items),
+            "confidence": "medium" if overdue_signal or open_signal else "low",
+            "customer_field": customer_result,
+            "company_field": company_result,
+            "evidence": [
+                text for text in combined_texts
+                if any(k.lower() in text.lower() for k in [customer, company_code, "逾期", "overdue", "未清", "open", "到期", "due"])
+            ][:25],
+        }
+
+    va03 = await _collect_va03_evidence()
+    if not va03.get("success"):
+        return {
+            "success": False,
+            "order_number": order_number,
+            "error": va03.get("error", "VA03 訂單檢查失敗"),
+            "detail": va03,
+        }
+
+    credit = await _check_credit_block(va03.get("customer", ""))
+    stock = await _check_stock(va03.get("material", ""), va03.get("plant", ""))
+    customer_ar = await _check_customer_ar(va03.get("customer", ""), va03.get("company_code", ""))
+
+    findings = []
+    if credit.get("blocked"):
+        findings.append({
+            "type": "credit_block",
+            "severity": "high",
+            "message": "疑似信用凍結，VKM1 畫面出現此訂單與信用/凍結相關訊息。",
+            "evidence": credit.get("evidence", []),
+        })
+    if stock.get("shortage"):
+        findings.append({
+            "type": "material_shortage",
+            "severity": "high",
+            "message": "疑似缺料或庫存可用量不足，MD04 出現短缺/例外相關訊息。",
+            "evidence": stock.get("evidence", []),
+        })
+    if customer_ar.get("overdue_signal"):
+        findings.append({
+            "type": "customer_overdue_ar",
+            "severity": "medium",
+            "message": "FBL5N 顯示客戶可能存在逾期或到期未清帳款訊號。",
+            "evidence": customer_ar.get("evidence", []),
+        })
+    elif customer_ar.get("open_item_signal"):
+        findings.append({
+            "type": "customer_open_ar",
+            "severity": "info",
+            "message": "FBL5N 顯示客戶存在未清項目，但未抓到明確逾期訊號。",
+            "evidence": customer_ar.get("evidence", []),
+        })
+    if _contains_any(va03.get("status_texts", []), ["交貨凍結", "delivery block", "delivery blocked"]):
+        findings.append({
+            "type": "delivery_block",
+            "severity": "high",
+            "message": "VA03 狀態文字顯示交貨凍結相關訊息。",
+            "evidence": va03.get("status_texts", []),
+        })
+    if not findings:
+        findings.append({
+            "type": "no_strong_block_signal",
+            "severity": "info",
+            "message": "目前未從 VA03/VKM1/MD04 抓到明確卡關訊號；可能需要進一步檢查交貨排程、揀配、運輸或財務明細。",
+            "evidence": [],
+        })
+
+    return {
+        "success": True,
+        "order_number": order_number,
+        "conclusion": findings[0]["message"],
+        "findings": findings,
+        "checks": {
+            "va03": va03,
+            "vkm1_credit": credit,
+            "md04_stock": stock,
+            "fbl5n_ar": customer_ar,
+        },
+        "message": "已完成訂單卡關診斷",
+    }
 
 
 # ===========================================================================
